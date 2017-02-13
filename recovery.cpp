@@ -31,6 +31,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/mount.h>
+#include <fs_mgr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -66,6 +68,8 @@
 #include "ui.h"
 #include "unique_fd.h"
 #include "screen_ui.h"
+
+#define UFS_DEV_SDCARD_BLK_PATH "/dev/block/mmcblk0p1"
 
 struct selabel_handle *sehandle;
 
@@ -189,6 +193,48 @@ static bool has_cache = false;
 
 static const int MAX_ARG_LENGTH = 4096;
 static const int MAX_ARGS = 100;
+
+#ifdef USE_MDTP
+
+#define MAX_CMD_LINE_LEN         (2048)
+
+static int is_mdtp_activated()
+{
+    char cmdline[MAX_CMD_LINE_LEN];
+    char *ptr;
+    int fd;
+    int mdtp_activated = 0;
+
+    fd = open("/proc/cmdline", O_RDONLY);
+    if (fd >= 0) {
+        int n = read(fd, cmdline, sizeof(cmdline) - 1);
+        if (n < 0)
+            n = 0;
+        /* get rid of trailing newline, it happens */
+        if (n > 0 && cmdline[n-1] == '\n') n--;
+        cmdline[n] = 0;
+        close(fd);
+    } else {
+        cmdline[0] = 0;
+    }
+
+    /* Look for the string "mdtp" in kernel cmdline, indicating that MDTP is activated.*/
+    ptr = cmdline;
+    while (ptr && *ptr) {
+        char *x = strchr(ptr, ' ');
+        if (x != 0)
+            *x++ = 0;
+        if (!strcmp(ptr,"mdtp")) {
+            mdtp_activated = 1;
+            break;
+        }
+
+        ptr = x;
+    }
+
+    return mdtp_activated;
+}
+#endif /* USE_MDTP */
 
 // open a given path, mounting partitions as necessary
 FILE* fopen_path(const char *path, const char *mode) {
@@ -1108,6 +1154,48 @@ static void run_graphics_test(Device* device) {
     ui->ShowText(true);
 }
 
+static int is_ufs_dev()
+{
+    char bootdevice[PROPERTY_VALUE_MAX] = {0};
+    property_get("ro.boot.bootdevice", bootdevice, "N/A");
+    ui->Print("ro.boot.bootdevice is: %s\n",bootdevice);
+    if (strlen(bootdevice) < strlen(".ufshc") + 1)
+        return 0;
+    return (!strncmp(&bootdevice[strlen(bootdevice) - strlen(".ufshc")],
+                            ".ufshc",
+                            sizeof(".ufshc")));
+}
+
+static int do_sdcard_mount_for_ufs()
+{
+    int rc = 0;
+    ui->Print("Update via sdcard on UFS dev.Mounting card\n");
+    Volume *v = volume_for_path("/sdcard");
+    if (v == NULL) {
+            ui->Print("Unknown volume for /sdcard.Check fstab\n");
+            goto error;
+    }
+    if (strncmp(v->fs_type, "vfat", sizeof("vfat"))) {
+            ui->Print("Unsupported format on the sdcard: %s\n",
+                            v->fs_type);
+            goto error;
+    }
+    rc = mount(UFS_DEV_SDCARD_BLK_PATH,
+                    v->mount_point,
+                    v->fs_type,
+                    v->flags,
+                    v->fs_options);
+    if (rc) {
+            ui->Print("Failed to mount sdcard : %s\n",
+                            strerror(errno));
+            goto error;
+    }
+    ui->Print("Done mounting sdcard\n");
+    return 0;
+error:
+    return -1;
+}
+
 // How long (in seconds) we wait for the fuse-provided package file to
 // appear, before timing out.
 #define SDCARD_INSTALL_TIMEOUT 10
@@ -1115,11 +1203,22 @@ static void run_graphics_test(Device* device) {
 static int apply_from_sdcard(Device* device, bool* wipe_cache) {
     modified_flash = true;
 
-    if (ensure_path_mounted(SDCARD_ROOT) != 0) {
-        ui->Print("\n-- Couldn't mount %s.\n", SDCARD_ROOT);
+    if (is_ufs_dev()) {
+            if (do_sdcard_mount_for_ufs() != 0) {
+                    ui->Print("\nFailed to mount sdcard\n");
+                    return INSTALL_ERROR;
+            }
+    } else  {
+             if (ensure_path_mounted(SDCARD_ROOT) != 0) {
+                 ui->Print("\n-- Couldn't mount %s.\n", SDCARD_ROOT);
+              return INSTALL_ERROR;
+             }
+    }
+    if (ensure_path_mounted("/cache") != 0 ||
+        ensure_path_mounted("/tmp") != 0) {
+        ui->Print("\nFailed to mount cache/tmp partition\n");
         return INSTALL_ERROR;
     }
-
     char* path = browse_directory(SDCARD_ROOT, device);
     if (path == NULL) {
         ui->Print("\n-- No package file selected.\n");
@@ -1271,24 +1370,31 @@ prompt_and_wait(Device* device, int status) {
                 break;
 
             case Device::MOUNT_SYSTEM:
-                char system_root_image[PROPERTY_VALUE_MAX];
-                property_get("ro.build.system_root_image", system_root_image, "");
+#ifdef USE_MDTP
+                if (is_mdtp_activated()) {
+                    ui->Print("Mounting /system forbidden by MDTP.\n");
+                }
+                else
+#endif
+                {
+                    char system_root_image[PROPERTY_VALUE_MAX];
+                    property_get("ro.build.system_root_image", system_root_image, "");
 
-                // For a system image built with the root directory (i.e.
-                // system_root_image == "true"), we mount it to /system_root, and symlink /system
-                // to /system_root/system to make adb shell work (the symlink is created through
-                // the build system).
-                // Bug: 22855115
-                if (strcmp(system_root_image, "true") == 0) {
-                    if (ensure_path_mounted_at("/", "/system_root") != -1) {
-                        ui->Print("Mounted /system.\n");
-                    }
-                } else {
-                    if (ensure_path_mounted("/system") != -1) {
-                        ui->Print("Mounted /system.\n");
+                    // For a system image built with the root directory (i.e.
+                    // system_root_image == "true"), we mount it to /system_root, and symlink /system
+                    // to /system_root/system to make adb shell work (the symlink is created through
+                    // the build system).
+                    // Bug: 22855115
+                    if (strcmp(system_root_image, "true") == 0) {
+                        if (ensure_path_mounted_at("/", "/system_root") != -1) {
+                            ui->Print("Mounted /system.\n");
+                        }
+                    } else {
+                        if (ensure_path_mounted("/system") != -1) {
+                            ui->Print("Mounted /system.\n");
+                        }
                     }
                 }
-
                 break;
         }
     }
@@ -1544,6 +1650,8 @@ int main(int argc, char **argv) {
     bool shutdown_after = false;
     int retry_count = 0;
     bool security_update = false;
+    int status = INSTALL_SUCCESS;
+    bool mount_required = true;
 
     int arg;
     int option_index;
@@ -1646,15 +1754,32 @@ int main(int argc, char **argv) {
             else
                 printf("modified_path allocation failed\n");
         }
+        if (!strncmp("/sdcard", update_package, 7)) {
+            //If this is a UFS device lets mount the sdcard ourselves.Depending
+            //on if the device is UFS or EMMC based the path to the sdcard
+            //device changes so we cannot rely on the block dev path from
+            //recovery.fstab
+            if (is_ufs_dev()) {
+                    if(do_sdcard_mount_for_ufs() != 0) {
+                            status = INSTALL_ERROR;
+                            goto error;
+                    }
+                    if (ensure_path_mounted("/cache") != 0 || ensure_path_mounted("/tmp") != 0) {
+                            ui->Print("\nFailed to mount tmp/cache partition\n");
+                            status = INSTALL_ERROR;
+                            goto error;
+                    }
+                    mount_required = false;
+            } else {
+                    ui->Print("Update via sdcard on EMMC dev. Using path from fstab\n");
+            }
+        }
     }
     printf("\n");
-
     property_list(print_property, NULL);
     printf("\n");
 
     ui->Print("Supported API: %d\n", RECOVERY_API_VERSION);
-
-    int status = INSTALL_SUCCESS;
 
     if (update_package != NULL) {
         // It's not entirely true that we will modify the flash. But we want
@@ -1675,7 +1800,7 @@ int main(int argc, char **argv) {
             status = INSTALL_SKIPPED;
         } else {
             status = install_package(update_package, &should_wipe_cache,
-                                     TEMPORARY_INSTALL_FILE, true, retry_count);
+                                     TEMPORARY_INSTALL_FILE, mount_required, retry_count);
             if (status == INSTALL_SUCCESS && should_wipe_cache) {
                 wipe_cache(false, device);
             }
@@ -1750,7 +1875,7 @@ int main(int argc, char **argv) {
             ui->ShowText(true);
         }
     }
-
+error:
     if (!sideload_auto_reboot && (status == INSTALL_ERROR || status == INSTALL_CORRUPT)) {
         copy_logs();
         ui->SetBackground(RecoveryUI::ERROR);
